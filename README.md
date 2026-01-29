@@ -44,6 +44,7 @@ This system gives Claude **persistent memory** across sessions:
 - [Ollama](https://ollama.com/) (for local embeddings)
 - Python 3.8+ (for the memory daemon)
 - Claude Code CLI
+- **For auto-extraction**: Either `ANTHROPIC_API_KEY` env var OR Ollama with a capable model (llama3, mistral, etc.)
 
 ### 1. Install Dependencies
 
@@ -54,9 +55,16 @@ curl -fsSL https://ollama.com/install.sh | sh
 # Pull the embedding model
 ollama pull nomic-embed-text
 
+# Optional: Pull a model for auto-extraction (if not using Anthropic API)
+ollama pull llama3
+
 # Clone this repo
-git clone https://github.com/YOUR_USERNAME/claude-code-memory.git
-cd claude-code-memory
+git clone https://github.com/zacdcook/claude-code-semantic-memory.git
+cd claude-code-semantic-memory
+
+# Set up scripts directory for hooks
+mkdir -p ~/.claude/memory-scripts
+cp scripts/extract-from-transcript.py ~/.claude/memory-scripts/
 ```
 
 ### 2. Convert Your Transcripts
@@ -128,7 +136,7 @@ chmod +x ~/.claude/hooks/*.sh
 Now:
 - Every prompt automatically queries memory and injects relevant learnings
 - During iteration, Claude's thinking is analyzed for additional relevant memories
-- When context compacts, the full transcript is exported, chunked, and embedded
+- When context compacts, the full transcript is exported and learnings are auto-extracted
 
 ---
 
@@ -166,21 +174,29 @@ CONTEXT COMPACTION (when context window fills)
 ┌─────────────────┐
 │  PreCompact     │ → Export transcript to disk
 │                 │ → Convert JSONL to markdown
-│                 │ → Chunk into ~4KB segments
-│                 │ → Embed each chunk for fork-detect
+│                 │ → Auto-extract learnings via LLM
+│                 │ → Store learnings in daemon
 └─────────────────┘
 ```
 
-### Two-Table Design
+### Auto-Extraction on Compaction
 
-The database has two distinct tables serving different purposes:
+When context compacts, the PreCompact hook automatically extracts learnings using an LLM:
 
-| Table | Purpose | Content | Use Case |
-|-------|---------|---------|----------|
-| `learnings` | Curated knowledge | Distilled facts, solutions, gotchas | Fast recall: "What's the working command?" |
-| `transcript_chunks` | Raw session history | Verbatim transcript segments | Fork detection: "Which session dealt with this?" |
+1. **Anthropic API** (if `ANTHROPIC_API_KEY` is set) - Uses Claude Sonnet for high-quality extraction
+2. **Ollama** (fallback) - Uses local models like llama3, mistral, etc.
 
-**Why two tables**: Learnings give Claude the answer in seconds. Chunks let you find which past session has relevant context to fork from.
+This means learnings are captured automatically without manual intervention. Set your API key:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Or ensure Ollama is running with a capable model:
+
+```bash
+ollama pull llama3
+```
 
 ### Learning Types
 
@@ -206,7 +222,6 @@ The database has two distinct tables serving different purposes:
 ### Database Schema
 
 ```sql
--- Curated learnings (distilled knowledge)
 CREATE TABLE learnings (
     id INTEGER PRIMARY KEY,
     type TEXT NOT NULL,
@@ -218,19 +233,7 @@ CREATE TABLE learnings (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Raw transcript chunks (for fork detection)
-CREATE TABLE transcript_chunks (
-    id INTEGER PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    chunk_index INTEGER NOT NULL,
-    content TEXT NOT NULL,
-    embedding BLOB NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(session_id, chunk_index)
-);
-
 CREATE INDEX idx_learnings_type ON learnings(type);
-CREATE INDEX idx_chunks_session ON transcript_chunks(session_id);
 ```
 
 ---
@@ -241,21 +244,22 @@ CREATE INDEX idx_chunks_session ON transcript_chunks(session_id);
 claude-code-memory/
 ├── README.md
 ├── scripts/
-│   ├── jsonl-to-markdown.js    # Convert transcripts
-│   └── import-learnings.py     # Import JSONL to database
+│   ├── jsonl-to-markdown.js      # Convert transcripts
+│   ├── import-learnings.py       # Import JSONL to database
+│   └── extract-from-transcript.py # Auto-extract learnings via LLM
 ├── prompts/
-│   └── extract-learnings.md    # Prompt for sub-agent extraction
+│   └── extract-learnings.md      # Prompt for manual sub-agent extraction
 ├── daemon/
-│   ├── server.py               # Flask API server
+│   ├── server.py                 # Flask API server
 │   ├── requirements.txt
-│   └── config.json             # Similarity thresholds, model config
+│   └── config.json               # Similarity thresholds, model config
 ├── hooks/
-│   ├── session-start.sh        # Check daemon, warn orphans
-│   ├── user-prompt-submit.sh   # Memory injection on prompts
-│   ├── pre-tool-use.sh         # Memory injection during iteration
-│   └── pre-compact.sh          # Auto-export and embed on compaction
+│   ├── session-start.sh          # Check daemon, warn orphans
+│   ├── user-prompt-submit.sh     # Memory injection on prompts
+│   ├── pre-tool-use.sh           # Memory injection during iteration
+│   └── pre-compact.sh            # Auto-export and extract on compaction
 └── examples/
-    └── sample-learnings.jsonl  # Example output format
+    └── sample-learnings.jsonl    # Example output format
 ```
 
 ---
@@ -302,15 +306,6 @@ export CLAUDE_DAEMON_HOST=100.95.72.101  # Desktop's Tailscale IP
 
 The hook will query the remote daemon instead of localhost.
 
-### Two-Table Design (Advanced)
-
-For larger setups, consider separating:
-
-- **Learnings table** — Curated, distilled knowledge for fast recall
-- **Transcript chunks table** — Raw session history for finding relevant past sessions to "fork" from
-
-This lets you search learnings for quick answers while also being able to find which past session dealt with a similar problem.
-
 ---
 
 ## Troubleshooting
@@ -323,6 +318,11 @@ This lets you search learnings for quick answers while also being able to find w
 - Check similarity threshold isn't too high
 - Verify learnings were imported: query the database directly
 - Try a more specific query
+
+### Auto-extraction not working
+- Verify `ANTHROPIC_API_KEY` is set, OR Ollama has a capable model (`ollama list`)
+- Check extract script exists: `ls ~/.claude/memory-scripts/extract-from-transcript.py`
+- Test manually: `python ~/.claude/memory-scripts/extract-from-transcript.py <transcript.md>`
 
 ### Slow embedding
 - Ensure Ollama is using GPU: `ollama ps` should show CUDA
