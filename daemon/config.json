@@ -1,0 +1,8 @@
+{
+  "embeddingModel": "nomic-embed-text",
+  "minSimilarity": 0.45,
+  "maxResults": 3,
+  "duplicateThreshold": 0.92,
+  "timeoutMs": 2500,
+  "port": 8741
+}
