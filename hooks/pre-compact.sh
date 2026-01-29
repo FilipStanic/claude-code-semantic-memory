@@ -1,19 +1,20 @@
 #!/bin/bash
 #
-# PreCompact Hook - Auto-export, convert, chunk, and embed transcripts
+# PreCompact Hook - Auto-export, convert, and extract learnings
 #
 # This hook fires when Claude Code is about to compact the context window.
 # It preserves the full session by:
 # 1. Exporting the raw JSONL transcript
 # 2. Converting to readable markdown
-# 3. Chunking the transcript into segments
-# 4. Embedding each chunk for future semantic search
-#
-# This enables "fork detection" - finding past sessions that dealt with
-# similar problems so you can resume from relevant context.
+# 3. Auto-extracting learnings using LLM (Anthropic API or Ollama)
+# 4. Storing learnings in the semantic memory database
 #
 # Install: cp pre-compact.sh ~/.claude/hooks/PreCompact.sh
 #          chmod +x ~/.claude/hooks/PreCompact.sh
+#
+# Requirements:
+# - ANTHROPIC_API_KEY env var, OR
+# - Ollama running with llama3/mistral/etc.
 
 set -euo pipefail
 
@@ -22,7 +23,7 @@ DAEMON_HOST="${CLAUDE_DAEMON_HOST:-127.0.0.1}"
 DAEMON_PORT="${CLAUDE_DAEMON_PORT:-8741}"
 DAEMON_URL="http://${DAEMON_HOST}:${DAEMON_PORT}"
 TRANSCRIPTS_DIR="${HOME}/.claude/transcripts"
-CHUNK_SIZE=4000  # ~4KB chunks to fit in embedding context
+SCRIPTS_DIR="${CLAUDE_MEMORY_SCRIPTS:-${HOME}/.claude/memory-scripts}"
 
 # Read input from stdin
 INPUT=$(cat)
@@ -46,7 +47,7 @@ cp "$TRANSCRIPT_PATH" "${SESSION_DIR}/transcript.jsonl"
 echo "✓ Exported transcript" >&2
 
 # 2. Convert to markdown
-python3 << 'CONVERT_SCRIPT'
+python3 << 'CONVERT_SCRIPT' "$SESSION_DIR"
 import json
 import sys
 from pathlib import Path
@@ -131,104 +132,20 @@ print(f"Converted {len(messages)} messages", file=sys.stderr)
 CONVERT_SCRIPT
 echo "✓ Converted to markdown" >&2
 
-# 3. Chunk the transcript
-python3 << 'CHUNK_SCRIPT'
-import json
-import sys
-from pathlib import Path
+# 3. Auto-extract learnings using LLM
+EXTRACT_SCRIPT="${SCRIPTS_DIR}/extract-from-transcript.py"
+if [ -f "$EXTRACT_SCRIPT" ]; then
+    echo "Extracting learnings..." >&2
+    python3 "$EXTRACT_SCRIPT" "${SESSION_DIR}/transcript.md" --daemon-url "$DAEMON_URL" || {
+        echo "⚠️  Learning extraction failed (LLM not available?)" >&2
+    }
+else
+    echo "⚠️  Extract script not found at $EXTRACT_SCRIPT" >&2
+    echo "   Skipping auto-extraction. Run manually later." >&2
+fi
 
-session_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
-md_path = session_dir / "transcript.md"
-chunks_path = session_dir / "chunks.json"
-chunk_size = int(sys.argv[2]) if len(sys.argv) > 2 else 4000
-
-content = md_path.read_text()
-
-# Split by message boundaries (---) first, then by size
-sections = content.split("\n---\n")
-chunks = []
-current_chunk = ""
-
-for section in sections:
-    section = section.strip()
-    if not section:
-        continue
-    
-    # If adding this section would exceed chunk size, save current and start new
-    if len(current_chunk) + len(section) > chunk_size and current_chunk:
-        chunks.append(current_chunk.strip())
-        current_chunk = section
-    else:
-        current_chunk += "\n---\n" + section if current_chunk else section
-
-# Don't forget the last chunk
-if current_chunk.strip():
-    chunks.append(current_chunk.strip())
-
-# Save chunks
-with open(chunks_path, 'w') as f:
-    json.dump({
-        'session_id': session_dir.name,
-        'chunk_count': len(chunks),
-        'chunks': chunks
-    }, f, indent=2)
-
-print(f"Created {len(chunks)} chunks", file=sys.stderr)
-CHUNK_SCRIPT
-echo "✓ Chunked transcript" >&2
-
-# 4. Embed chunks and store in daemon
-python3 << 'EMBED_SCRIPT'
-import json
-import sys
-import requests
-from pathlib import Path
-
-session_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
-daemon_url = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:8741"
-chunks_path = session_dir / "chunks.json"
-
-# Check daemon health
-try:
-    resp = requests.get(f"{daemon_url}/health", timeout=2)
-    if resp.status_code != 200:
-        print("Daemon not healthy, skipping embedding", file=sys.stderr)
-        sys.exit(0)
-except:
-    print("Daemon not reachable, skipping embedding", file=sys.stderr)
-    sys.exit(0)
-
-# Load chunks
-with open(chunks_path) as f:
-    data = json.load(f)
-
-session_id = data['session_id']
-chunks = data['chunks']
-
-# Store each chunk
-stored = 0
-for i, chunk in enumerate(chunks):
-    try:
-        resp = requests.post(
-            f"{daemon_url}/chunks/store",
-            json={
-                'session_id': session_id,
-                'chunk_index': i,
-                'content': chunk
-            },
-            timeout=10
-        )
-        if resp.status_code == 200:
-            stored += 1
-    except Exception as e:
-        print(f"Failed to store chunk {i}: {e}", file=sys.stderr)
-
-print(f"Embedded {stored}/{len(chunks)} chunks", file=sys.stderr)
-EMBED_SCRIPT
-echo "✓ Embedded chunks" >&2
-
-# 5. Write metadata
-python3 << 'META_SCRIPT'
+# 4. Write metadata
+python3 << 'META_SCRIPT' "$SESSION_DIR" "$SESSION_ID" "$PROJECT_PATH"
 import json
 import sys
 from pathlib import Path
@@ -238,18 +155,11 @@ session_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
 session_id = sys.argv[2] if len(sys.argv) > 2 else "unknown"
 project_path = sys.argv[3] if len(sys.argv) > 3 else ""
 
-chunks_path = session_dir / "chunks.json"
-chunk_count = 0
-if chunks_path.exists():
-    with open(chunks_path) as f:
-        chunk_count = json.load(f).get('chunk_count', 0)
-
 metadata = {
     'session_id': session_id,
     'project_path': project_path,
     'compacted_at': datetime.now().isoformat(),
-    'chunk_count': chunk_count,
-    'files': ['transcript.jsonl', 'transcript.md', 'chunks.json']
+    'files': ['transcript.jsonl', 'transcript.md']
 }
 
 with open(session_dir / "metadata.json", 'w') as f:
