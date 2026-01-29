@@ -104,20 +104,83 @@ The daemon runs on port 8741 and provides:
 python scripts/import-learnings.py ~/extracted-learnings.jsonl
 ```
 
-### 6. Install the Hook
+### 6. Install the Hooks
 
-Copy the hook to your Claude Code hooks directory:
+Copy all hooks to your Claude Code hooks directory:
 
 ```bash
+# Session initialization
+cp hooks/session-start.sh ~/.claude/hooks/SessionStart.sh
+
+# Memory injection on prompts
 cp hooks/user-prompt-submit.sh ~/.claude/hooks/UserPromptSubmit.sh
-chmod +x ~/.claude/hooks/UserPromptSubmit.sh
+
+# Memory injection during iteration
+cp hooks/pre-tool-use.sh ~/.claude/hooks/PreToolUse.sh
+
+# Auto-export on compaction
+cp hooks/pre-compact.sh ~/.claude/hooks/PreCompact.sh
+
+# Make executable
+chmod +x ~/.claude/hooks/*.sh
 ```
 
-Now every prompt you send will automatically query the memory daemon and inject relevant learnings.
+Now:
+- Every prompt automatically queries memory and injects relevant learnings
+- During iteration, Claude's thinking is analyzed for additional relevant memories
+- When context compacts, the full transcript is exported, chunked, and embedded
 
 ---
 
 ## Architecture
+
+### Hook Lifecycle
+
+```
+SESSION START
+════════════
+┌─────────────────┐
+│  SessionStart   │ → Check daemon health
+│                 │ → Warn about orphaned transcripts
+└────────┬────────┘
+         │
+ACTIVE WORK (repeats for each user message)
+════════════
+         ▼
+┌─────────────────┐
+│UserPromptSubmit │ → Embed user's prompt
+│                 │ → Query daemon /recall
+│                 │ → Inject top 3 memories
+└────────┬────────┘
+         │
+         ▼  (fires before EACH tool)
+┌─────────────────┐
+│  PreToolUse     │ → Extract Claude's thinking
+│                 │ → Query for new relevant memories
+│                 │ → Inject if thinking has drifted
+└────────┬────────┘
+         │
+CONTEXT COMPACTION (when context window fills)
+════════════════════
+         ▼
+┌─────────────────┐
+│  PreCompact     │ → Export transcript to disk
+│                 │ → Convert JSONL to markdown
+│                 │ → Chunk into ~4KB segments
+│                 │ → Embed each chunk for fork-detect
+└─────────────────┘
+```
+
+### Two-Table Design
+
+The database has two distinct tables serving different purposes:
+
+| Table | Purpose | Content | Use Case |
+|-------|---------|---------|----------|
+| `learnings` | Curated knowledge | Distilled facts, solutions, gotchas | Fast recall: "What's the working command?" |
+| `transcript_chunks` | Raw session history | Verbatim transcript segments | Fork detection: "Which session dealt with this?" |
+
+**Why two tables**: Learnings give Claude the answer in seconds. Chunks let you find which past session has relevant context to fork from.
 
 ### Learning Types
 
@@ -143,6 +206,7 @@ Now every prompt you send will automatically query the memory daemon and inject 
 ### Database Schema
 
 ```sql
+-- Curated learnings (distilled knowledge)
 CREATE TABLE learnings (
     id INTEGER PRIMARY KEY,
     type TEXT NOT NULL,
@@ -154,7 +218,19 @@ CREATE TABLE learnings (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Raw transcript chunks (for fork detection)
+CREATE TABLE transcript_chunks (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    embedding BLOB NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(session_id, chunk_index)
+);
+
 CREATE INDEX idx_learnings_type ON learnings(type);
+CREATE INDEX idx_chunks_session ON transcript_chunks(session_id);
 ```
 
 ---
@@ -174,9 +250,12 @@ claude-code-memory/
 │   ├── requirements.txt
 │   └── config.json             # Similarity thresholds, model config
 ├── hooks/
-│   └── user-prompt-submit.sh   # Claude Code hook
+│   ├── session-start.sh        # Check daemon, warn orphans
+│   ├── user-prompt-submit.sh   # Memory injection on prompts
+│   ├── pre-tool-use.sh         # Memory injection during iteration
+│   └── pre-compact.sh          # Auto-export and embed on compaction
 └── examples/
-    └── sample-learning.jsonl   # Example output format
+    └── sample-learnings.jsonl  # Example output format
 ```
 
 ---
