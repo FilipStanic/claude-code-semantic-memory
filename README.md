@@ -174,29 +174,26 @@ CONTEXT COMPACTION (when context window fills)
 ┌─────────────────┐
 │  PreCompact     │ → Export transcript to disk
 │                 │ → Convert JSONL to markdown
-│                 │ → Auto-extract learnings via LLM
-│                 │ → Store learnings in daemon
+│                 │ → Output sub-agent dispatch instructions
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  Sub-Agent      │ → Read exported transcript
+│  (Task tool)    │ → Extract learnings
+│                 │ → Store via daemon /store endpoint
 └─────────────────┘
 ```
 
-### Auto-Extraction on Compaction
+### Sub-Agent Extraction on Compaction
 
-When context compacts, the PreCompact hook automatically extracts learnings using an LLM:
+When context compacts, the PreCompact hook exports the transcript and outputs instructions for Claude to dispatch a sub-agent. The sub-agent:
 
-1. **Anthropic API** (if `ANTHROPIC_API_KEY` is set) - Uses Claude Sonnet for high-quality extraction
-2. **Ollama** (fallback) - Uses local models like llama3, mistral, etc.
+1. Reads the exported markdown transcript
+2. Extracts learnings (solutions, gotchas, patterns, etc.)
+3. Stores each learning via the daemon's `/store` endpoint
 
-This means learnings are captured automatically without manual intervention. Set your API key:
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-```
-
-Or ensure Ollama is running with a capable model:
-
-```bash
-ollama pull llama3
-```
+This keeps everything within Claude Code - no external API calls or local models needed for extraction. The sub-agent uses the Task tool to run in parallel without blocking the main session.
 
 ### Learning Types
 
